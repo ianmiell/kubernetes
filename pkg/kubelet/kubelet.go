@@ -93,7 +93,7 @@ func NewIntegrationTestKubelet(hn string, dc DockerInterface) *Kubelet {
 }
 
 type ContainerCommandRunner interface {
-	RunInContainer(containerID string, cmd []string) ([]byte, error)
+	RunInContainer(containerID string, cmd []string, kill <-chan bool) ([]byte, error)
 }
 
 // Kubelet is the main kubelet implementation.
@@ -327,6 +327,13 @@ func (kl *Kubelet) runContainer(pod *Pod, container *api.Container, podVolumes v
 	if kl.lifecycle != nil {
 		if output, err := kl.lifecycle.PostStart(dockerContainer.ID); err != nil {
 			glog.Infof("failed to run on start: %v, %s", err, output.Details)
+			if output.TimedOut {
+				err = kl.dockerClient.StopContainer(dockerContainer.ID, 10)
+				if err != nil {
+					glog.Errorf("failed to kill container: %v", err)
+				}
+				return "", fmt.Errorf("lifecycle PostStart event timed out.")
+			}
 		}
 	}
 	return DockerID(dockerContainer.ID), err
@@ -757,5 +764,5 @@ func (kl *Kubelet) RunInContainer(podFullName, container string, cmd []string) (
 	if !found {
 		return nil, fmt.Errorf("container not found (%s)", container)
 	}
-	return kl.runner.RunInContainer(dockerContainer.ID, cmd)
+	return kl.runner.RunInContainer(dockerContainer.ID, cmd, make(chan bool))
 }

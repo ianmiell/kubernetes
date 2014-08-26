@@ -1034,20 +1034,8 @@ func TestGetContainerInfoOnNonExistContainer(t *testing.T) {
 	mockCadvisor.AssertExpectations(t)
 }
 
-type fakeContainerCommandRunner struct {
-	Cmd []string
-	ID  string
-	E   error
-}
-
-func (f *fakeContainerCommandRunner) RunInContainer(id string, cmd []string) ([]byte, error) {
-	f.Cmd = cmd
-	f.ID = id
-	return []byte{}, f.E
-}
-
 func TestRunInContainerNoSuchPod(t *testing.T) {
-	fakeCommandRunner := fakeContainerCommandRunner{}
+	fakeCommandRunner := fakeCommandRunner{}
 	kubelet, _, fakeDocker := newTestKubelet(t)
 	fakeDocker.containerList = []docker.APIContainers{}
 	kubelet.runner = &fakeCommandRunner
@@ -1068,7 +1056,7 @@ func TestRunInContainerNoSuchPod(t *testing.T) {
 }
 
 func TestRunInContainer(t *testing.T) {
-	fakeCommandRunner := fakeContainerCommandRunner{}
+	fakeCommandRunner := fakeCommandRunner{}
 	kubelet, _, fakeDocker := newTestKubelet(t)
 	kubelet.runner = &fakeCommandRunner
 
@@ -1089,11 +1077,14 @@ func TestRunInContainer(t *testing.T) {
 		podName+"."+podNamespace,
 		containerName,
 		cmd)
-	if fakeCommandRunner.ID != containerID {
-		t.Errorf("unexected ID: %s", fakeCommandRunner.ID)
+	if len(fakeCommandRunner.commands) != 1 {
+		t.Fatalf("unexpected commands: %v", fakeCommandRunner.commands)
 	}
-	if !reflect.DeepEqual(fakeCommandRunner.Cmd, cmd) {
-		t.Errorf("unexpected commnd: %s", fakeCommandRunner.Cmd)
+	if fakeCommandRunner.commands[0].id != containerID {
+		t.Errorf("unexected ID: %s", fakeCommandRunner.commands[0].id)
+	}
+	if !reflect.DeepEqual(fakeCommandRunner.commands[0].command, cmd) {
+		t.Errorf("unexpected commnd: %s", fakeCommandRunner.commands[0].command)
 	}
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)

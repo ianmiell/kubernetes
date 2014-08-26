@@ -16,9 +16,15 @@ limitations under the License.
 
 package kubelet
 
+import (
+	"fmt"
+	"time"
+)
+
 // LifecycleOutput is the output from a lifecycle event
 type LifecycleOutput struct {
-	Details string
+	Details  string
+	TimedOut bool
 }
 
 // Lifecycle is an interface implemented by things that handle lifecycle events
@@ -31,17 +37,29 @@ type Lifecycle interface {
 
 func newCommandLineLifecycle(r ContainerCommandRunner) Lifecycle {
 	return &commandLineLifecycle{
-		runner: r,
+		runner:  r,
+		timeout: time.Second * 30,
 	}
 }
 
 type commandLineLifecycle struct {
-	runner ContainerCommandRunner
+	runner  ContainerCommandRunner
+	timeout time.Duration
 }
 
 func (c *commandLineLifecycle) runLifecycleCommand(containerID string, cmd []string) (LifecycleOutput, error) {
-	data, err := c.runner.RunInContainer(containerID, cmd)
-	return LifecycleOutput{string(data)}, err
+	kill := make(chan bool)
+	timer := time.AfterFunc(c.timeout, func() {
+		kill <- true
+	})
+	data, err := c.runner.RunInContainer(containerID, cmd, kill)
+	if timer.Stop() {
+		return LifecycleOutput{Details: string(data)}, err
+	}
+	return LifecycleOutput{
+		Details:  "Timed Out",
+		TimedOut: true,
+	}, fmt.Errorf("aborted")
 }
 
 func (c *commandLineLifecycle) PostStart(containerID string) (LifecycleOutput, error) {

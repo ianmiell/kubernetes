@@ -77,12 +77,30 @@ func (d *dockerContainerCommandRunner) getRunInContainerCommand(containerID stri
 }
 
 // RunInContainer uses nsinit to run the command inside the container identified by containerID
-func (d *dockerContainerCommandRunner) RunInContainer(containerID string, cmd []string) ([]byte, error) {
+// It runs the command asynchronously, and will kill the command if it receives data on the kill channel
+func (d *dockerContainerCommandRunner) RunInContainer(containerID string, cmd []string, kill <-chan bool) ([]byte, error) {
 	c, err := d.getRunInContainerCommand(containerID, cmd)
 	if err != nil {
 		return nil, err
 	}
-	return c.CombinedOutput()
+	var out []byte
+	complete := make(chan bool)
+	go func() {
+		out, err = c.CombinedOutput()
+		complete <- true
+		close(complete)
+	}()
+
+	select {
+	case <-kill:
+		if err := c.Process.Kill(); err != nil {
+			glog.Errorf("failed to kill container command: %v", err)
+		}
+		return nil, fmt.Errorf("aborted")
+	case <-complete:
+		return out, err
+	}
+	return out, err
 }
 
 // NewDockerContainerCommandRunner creates a ContainerCommandRunner which uses nsinit to run a command

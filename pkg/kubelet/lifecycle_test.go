@@ -17,7 +17,9 @@ limitations under the License.
 package kubelet
 
 import (
+	"fmt"
 	"testing"
+	"time"
 )
 
 type commandState struct {
@@ -27,19 +29,37 @@ type commandState struct {
 
 type fakeCommandRunner struct {
 	commands []commandState
+	sleep    *time.Duration
 	output   []byte
 	err      error
 }
 
-func (f *fakeCommandRunner) RunInContainer(id string, cmd []string) ([]byte, error) {
+func (f *fakeCommandRunner) RunInContainer(id string, cmd []string, kill <-chan bool) ([]byte, error) {
+	if f.sleep != nil {
+		select {
+		case <-time.After(*f.sleep):
+		case <-kill:
+			return f.output, fmt.Errorf("aborted")
+		}
+	}
 	f.commands = append(f.commands, commandState{id: id, command: cmd})
 	return f.output, f.err
 }
 
 func TestPostStart(t *testing.T) {
-	fake := fakeCommandRunner{}
+	fake := fakeCommandRunner{
+		output: []byte("Foo"),
+	}
 	lifecycle := newCommandLineLifecycle(&fake)
-	lifecycle.PostStart("foo")
+	out, err := lifecycle.PostStart("foo")
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if out.Details != "Foo" {
+		t.Errorf("unexpected output: %v", out)
+	}
 
 	if len(fake.commands) != 1 || fake.commands[0].id != "foo" || fake.commands[0].command[0] != "kubernetes-on-start.sh" {
 		t.Errorf("unexpected commands: %v", fake.commands)
@@ -47,11 +67,35 @@ func TestPostStart(t *testing.T) {
 }
 
 func TestPreStop(t *testing.T) {
-	fake := fakeCommandRunner{}
+	fake := fakeCommandRunner{
+		output: []byte("Foo"),
+	}
 	lifecycle := newCommandLineLifecycle(&fake)
-	lifecycle.PreStop("foo")
+	out, err := lifecycle.PreStop("foo")
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if out.Details != "Foo" {
+		t.Errorf("unexpected output: %v", out)
+	}
 
 	if len(fake.commands) != 1 || fake.commands[0].id != "foo" || fake.commands[0].command[0] != "kubernetes-on-stop.sh" {
 		t.Errorf("unexpected commands: %v", fake.commands)
+	}
+}
+
+func TestTimeout(t *testing.T) {
+	sleep := time.Second * 10
+	fake := fakeCommandRunner{
+		sleep: &sleep,
+	}
+	lifecycle := newCommandLineLifecycle(&fake)
+	lifecycle.(*commandLineLifecycle).timeout = time.Millisecond
+	_, err := lifecycle.PreStop("foo")
+
+	if err == nil {
+		t.Error("unexpected non-error")
 	}
 }
