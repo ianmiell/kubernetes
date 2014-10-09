@@ -235,7 +235,7 @@ func main() {
 	}
 
 	if *proxy {
-		glog.Info("Starting to serve on localhost:8001")
+		glog.Info("Starting to serve on http://localhost:8001/static/")
 		server := kubecfg.NewProxyServer(*www, kubeClient)
 		glog.Fatal(server.Serve())
 	}

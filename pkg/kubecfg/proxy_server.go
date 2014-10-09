@@ -23,6 +23,7 @@ import (
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/latest"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/client"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/ui"
 )
 
 // ProxyServer is a http.Handler which proxies Kubernetes APIs to remote API server.
@@ -41,7 +42,11 @@ func NewProxyServer(filebase string, kubeClient *client.Client) *ProxyServer {
 		Client: kubeClient,
 	}
 	http.Handle("/api/", server)
-	http.Handle("/static/", newFileHandler("/static/", filebase))
+	if len(filebase) > 0 {
+		http.Handle("/static/", newFileHandler("/static/", filebase))
+	} else {
+		ui.InstallSupport(http.DefaultServeMux)
+	}
 	return server
 }
 
