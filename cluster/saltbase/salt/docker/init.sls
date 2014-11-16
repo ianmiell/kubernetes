@@ -39,6 +39,10 @@ cbr0:
   container_bridge.ensure:
     - cidr: {{ grains['cbr-cidr'] }}
     - mtu: 1460
+{% if grains.cloud is defined
+   and grains.cloud == 'gce' %}
+    - nat: True
+{% endif %}
 
 purge-old-docker:
   pkg.removed:
