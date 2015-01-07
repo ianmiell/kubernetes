@@ -696,7 +696,7 @@ const (
 )
 
 // createNetworkContainer starts the network container for a pod. Returns the docker container ID of the newly created container.
-func (kl *Kubelet) createNetworkContainer(pod *api.BoundPod) (dockertools.DockerID, error) {
+func (kl *Kubelet) createNetworkContainer(pod *api.BoundPod, podFullname string) (dockertools.DockerID, error) {
 	var ports []api.Port
 	// Docker only exports ports from the network container.  Let's
 	// collect all of the relevant ports and export them.
@@ -704,36 +704,17 @@ func (kl *Kubelet) createNetworkContainer(pod *api.BoundPod) (dockertools.Docker
 		ports = append(ports, container.Ports...)
 	}
 	container := &api.Container{
-		Name:  networkContainerName,
-		Image: kl.networkContainerImage,
-		Ports: ports,
+		Name:            networkContainerName,
+		Image:           kl.networkContainerImage,
+		ImagePullPolicy: api.PullIfNotPresent,
+		Ports:           ports,
 	}
 	ref, err := containerRef(pod, container)
 	if err != nil {
 		glog.Errorf("Couldn't make a ref to pod %v, container %v: '%v'", pod.Name, container.Name, err)
 	}
 
-	kl.pullLock.RLock()
-	defer kl.pullLock.RUnlock()
-
-	// TODO: make this a TTL based pull (if image older than X policy, pull)
-	ok, err := kl.dockerPuller.IsImagePresent(container.Image)
-	if err != nil {
-		if ref != nil {
-			record.Eventf(ref, "failed", "failed", "Failed to inspect image %q", container.Image)
-		}
-		return "", err
-	}
-
-	if !ok {
-		if err := kl.pullImage(container.Image, ref); err != nil {
-			return "", err
-		}
-	}
-	if ref != nil {
-		record.Eventf(ref, "waiting", "pulled", "Successfully pulled image %q", container.Image)
-	}
-	return kl.runContainer(pod, container, nil, "")
+	return kl.pullImageAndRun(container, ref, pod, podFullname, nil, "")
 }
 
 func (kl *Kubelet) pullImage(img string, ref *api.ObjectReference) error {
@@ -799,7 +780,7 @@ func (kl *Kubelet) syncPod(pod *api.BoundPod, dockerContainers dockertools.Docke
 		if err != nil {
 			return err
 		}
-		netID, err = kl.createNetworkContainer(pod)
+		netID, err = kl.createNetworkContainer(pod, podFullName)
 		if err != nil {
 			glog.Errorf("Failed to introspect network container: %v; Skipping pod %q", err, podFullName)
 			return err
@@ -897,41 +878,12 @@ func (kl *Kubelet) syncPod(pod *api.BoundPod, dockerContainers dockertools.Docke
 		if err != nil {
 			glog.Errorf("Couldn't make a ref to pod %v, container %v: '%v'", pod.Name, container.Name, err)
 		}
-		kl.pullLock.RLock()
-		defer kl.pullLock.RUnlock()
-		if !api.IsPullNever(container.ImagePullPolicy) {
-			present, err := kl.dockerPuller.IsImagePresent(container.Image)
-			latest := dockertools.RequireLatestImage(container.Image)
-			if err != nil {
-				if ref != nil {
-					record.Eventf(ref, "failed", "failed", "Failed to inspect image %q", container.Image)
-				}
-				glog.Errorf("Failed to inspect image %q: %v; skipping pod %q container %q", container.Image, err, podFullName, container.Name)
-				continue
-			}
-			if api.IsPullAlways(container.ImagePullPolicy) ||
-				(api.IsPullIfNotPresent(container.ImagePullPolicy) && (!present || latest)) {
-				if err := kl.dockerPuller.Pull(container.Image); err != nil {
-					if ref != nil {
-
-						record.Eventf(ref, "failed", "failed", "Failed to pull image %q", container.Image)
-					}
-					glog.Errorf("Failed to pull image %q: %v; skipping pod %q container %q.", container.Image, err, podFullName, container.Name)
-					continue
-				}
-				if ref != nil {
-					record.Eventf(ref, "waiting", "pulled", "Successfully pulled image %q", container.Image)
-				}
-			}
-		}
-		// TODO(dawnchen): Check RestartPolicy.DelaySeconds before restart a container
-		containerID, err := kl.runContainer(pod, &container, podVolumes, "container:"+string(netID))
+		containerID, err := kl.pullImageAndRun(&container, ref, pod, podFullName, podVolumes, "container:"+string(netID))
 		if err != nil {
-			// TODO(bburns) : Perhaps blacklist a container after N failures?
-			glog.Errorf("Error running pod %q container %q: %v", podFullName, container.Name, err)
 			continue
 		}
 		containersToKeep[containerID] = empty{}
+		kl.pullLock.RUnlock()
 	}
 
 	// Kill any containers in this pod which were not identified above (guards against duplicates).
@@ -952,6 +904,47 @@ func (kl *Kubelet) syncPod(pod *api.BoundPod, dockerContainers dockertools.Docke
 	}
 
 	return nil
+}
+
+func (kl *Kubelet) pullImageAndRun(container *api.Container, ref *api.ObjectReference, pod *api.BoundPod, podFullName string, podVolumes volumeMap, net string) (dockertools.DockerID, error) {
+	kl.pullLock.RLock()
+	defer kl.pullLock.RUnlock()
+	if !api.IsPullNever(container.ImagePullPolicy) {
+		present, err := kl.dockerPuller.IsImagePresent(container.Image)
+		latest := dockertools.RequireLatestImage(container.Image)
+		if err != nil {
+			if ref != nil {
+				record.Eventf(ref, "failed", "failed", "Failed to inspect image %q", container.Image)
+			}
+			glog.Errorf("Failed to inspect image %q: %v; skipping pod %q container %q", container.Image, err, podFullName, container.Name)
+			return "", err
+		}
+		if api.IsPullAlways(container.ImagePullPolicy) ||
+			(api.IsPullIfNotPresent(container.ImagePullPolicy) && (!present || latest)) {
+			if err := kl.pullImage(container.Image, ref); err != nil {
+				return "", err
+			}
+			if err := kl.dockerPuller.Pull(container.Image); err != nil {
+				if ref != nil {
+
+					record.Eventf(ref, "failed", "failed", "Failed to pull image %q", container.Image)
+				}
+				glog.Errorf("Failed to pull image %q: %v; skipping pod %q container %q.", container.Image, err, podFullName, container.Name)
+				return "", err
+			}
+			if ref != nil {
+				record.Eventf(ref, "waiting", "pulled", "Successfully pulled image %q", container.Image)
+			}
+		}
+	}
+	// TODO(dawnchen): Check RestartPolicy.DelaySeconds before restart a container
+	containerID, err := kl.runContainer(pod, container, podVolumes, net)
+	if err != nil {
+		// TODO(bburns) : Perhaps blacklist a container after N failures?
+		glog.Errorf("Error running pod %q container %q: %v", podFullName, container.Name, err)
+		return "", err
+	}
+	return containerID, nil
 }
 
 type podContainer struct {
