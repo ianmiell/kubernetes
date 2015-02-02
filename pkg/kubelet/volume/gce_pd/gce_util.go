@@ -44,10 +44,6 @@ func (util *GCEDiskUtil) AttachDisk(pd *gcePersistentDisk) error {
 	if err != nil {
 		return err
 	}
-	flags := uintptr(0)
-	if pd.readOnly {
-		flags = mount.FlagReadOnly
-	}
 	if err := gce.(*gce_cloud.GCECloud).AttachDisk(pd.pdName, pd.readOnly); err != nil {
 		return err
 	}
@@ -85,6 +81,10 @@ func (util *GCEDiskUtil) AttachDisk(pd *gcePersistentDisk) error {
 		}
 	}
 	if !mountpoint {
+		flags := uintptr(0)
+		if pd.readOnly {
+			flags = mount.FlagReadOnly
+		}
 		err = pd.mounter.Mount(devicePath, globalPDPath, pd.fsType, flags, "")
 		if err != nil {
 			os.Remove(globalPDPath)

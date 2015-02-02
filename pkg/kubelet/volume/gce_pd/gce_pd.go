@@ -18,13 +18,19 @@ package gce_pd
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/cloudprovider/gce"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/kubelet/volume"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/types"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util/mount"
 	"github.com/golang/glog"
 )
@@ -34,12 +40,41 @@ func ProbeVolumePlugins() []volume.Plugin {
 	return []volume.Plugin{&gcePersistentDiskPlugin{nil, false}, &gcePersistentDiskPlugin{nil, true}}
 }
 
+type attachedDisk struct {
+	name     string
+	readOnly bool
+	refCount int
+}
+
+type attachedDiskManager struct {
+	lock          sync.Mutex
+	attachedDisks map[string]attachedDisk
+	host          volume.Host
+	changes       chan bool
+}
+
 type gcePersistentDiskPlugin struct {
 	host       volume.Host
 	legacyMode bool // if set, plugin answers to the legacy name
 }
 
 var _ volume.Plugin = &gcePersistentDiskPlugin{}
+
+var mgrLock sync.Mutex = sync.Mutex{}
+var attachedDiskMgr *attachedDiskManager = nil
+
+func initAttachedDiskManager(host volume.Host) {
+	mgrLock.Lock()
+	defer mgrLock.Unlock()
+	if attachedDiskMgr == nil {
+		attachedDiskMgr = &attachedDiskManager{
+			attachedDisks: map[string]attachedDisk{},
+			host:          host,
+			changes:       make(chan bool),
+		}
+		util.Forever(attachedDiskMgr.SyncDiskAttaches, 0)
+	}
+}
 
 const (
 	gcePersistentDiskPluginName       = "kubernetes.io/gce-pd"
@@ -48,6 +83,7 @@ const (
 
 func (plugin *gcePersistentDiskPlugin) Init(host volume.Host) {
 	plugin.host = host
+	initAttachedDiskManager(host)
 }
 
 func (plugin *gcePersistentDiskPlugin) Name() string {
@@ -122,6 +158,76 @@ func (plugin *gcePersistentDiskPlugin) newCleanerInternal(volName string, podUID
 	}, nil
 }
 
+func (mgr *attachedDiskManager) AttachDisk(name string, readOnly bool) {
+	mgr.lock.Lock()
+	defer mgr.lock.Unlock()
+
+	disk, found := mgr.attachedDisks[name]
+	if found {
+		disk.refCount++
+	} else {
+		mgr.attachedDisks[name] = attachedDisk{
+			name:     name,
+			readOnly: readOnly,
+			refCount: 1,
+		}
+	}
+}
+
+func (mgr *attachedDiskManager) DetachDisk(name string) {
+	mgr.lock.Lock()
+	defer mgr.lock.Unlock()
+
+	disk, found := mgr.attachedDisks[name]
+	if found {
+		disk.refCount--
+		if disk.refCount == 0 {
+			delete(mgr.attachedDisks, name)
+		}
+	}
+}
+
+func (mgr *attachedDiskManager) Notify() {
+	mgr.changes <- true
+}
+
+func (mgr *attachedDiskManager) SyncDiskAttaches() {
+	// Wait on notifications, or loop every minute in case we missed something.
+	select {
+	case <-mgr.changes:
+		return
+	case <-time.After(time.Minute * 1):
+		return
+	}
+	mgr.lock.Lock()
+	defer mgr.lock.Unlock()
+	gce, err := cloudprovider.GetCloudProvider("gce", nil)
+	if err != nil {
+		glog.Warningf("Failed to get gce cloud provider: %v", err)
+		return
+	}
+	names := util.StringSet{}
+	for _, disk := range mgr.attachedDisks {
+		names.Insert(disk.name)
+		if _, err := os.Stat("/dev/disk/by-id/google-" + disk.name); err == nil {
+			continue
+		}
+		if os.IsNotExist(err) {
+			if err := gce.(*gce_cloud.GCECloud).AttachDisk(disk.name, disk.readOnly); err != nil {
+				glog.Warningf("Failed to attach disk: %v", err)
+			}
+		} else {
+			glog.Warningf("Failed to stat disk: %v", err)
+		}
+	}
+	pds, err := listGlobalPDs(mgr.host)
+	for _, pd := range pds {
+		if !names.Has(pd) {
+			gce.(*gce_cloud.GCECloud).DetachDisk("/dev/disk/by-id/google-" + pd)
+		}
+	}
+}
+
 // Abstract interface to PD operations.
 type pdManager interface {
 	// Attaches the disk to the kubelet's host machine.
@@ -163,7 +269,8 @@ func (pd *gcePersistentDisk) SetUp() error {
 	if pd.legacyMode {
 		return fmt.Errorf("legacy mode: can not create new instances")
 	}
-
+	attachedDiskMgr.AttachDisk(pd.pdName, pd.readOnly)
+	attachedDiskMgr.Notify()
 	// TODO: handle failed mounts here.
 	mountpoint, err := isMountPoint(pd.GetPath())
 	glog.V(4).Infof("PersistentDisk set up: %s %v %v", pd.GetPath(), mountpoint, err)
@@ -175,6 +282,8 @@ func (pd *gcePersistentDisk) SetUp() error {
 	}
 
 	if err := pd.manager.AttachDisk(pd); err != nil {
+		attachedDiskMgr.DetachDisk(pd.pdName)
+		attachedDiskMgr.Notify()
 		return err
 	}
 
@@ -182,11 +291,10 @@ func (pd *gcePersistentDisk) SetUp() error {
 	if pd.readOnly {
 		flags = mount.FlagReadOnly
 	}
-
 	volPath := pd.GetPath()
 	if err := os.MkdirAll(volPath, 0750); err != nil {
-		// TODO: we should really eject the attach/detach out into its own control loop.
-		detachDiskLogError(pd)
+		attachedDiskMgr.DetachDisk(pd.pdName)
+		attachedDiskMgr.Notify()
 		return err
 	}
 
@@ -194,6 +302,8 @@ func (pd *gcePersistentDisk) SetUp() error {
 	globalPDPath := makeGlobalPDName(pd.plugin.host, pd.pdName, pd.readOnly)
 	err = pd.mounter.Mount(globalPDPath, pd.GetPath(), "", mount.FlagBind|flags, "")
 	if err != nil {
+		attachedDiskMgr.DetachDisk(pd.pdName)
+		attachedDiskMgr.Notify()
 		mountpoint, mntErr := isMountPoint(pd.GetPath())
 		if mntErr != nil {
 			glog.Errorf("isMountpoint check failed: %v", mntErr)
@@ -216,8 +326,6 @@ func (pd *gcePersistentDisk) SetUp() error {
 			}
 		} else {
 			os.Remove(pd.GetPath())
-			// TODO: we should really eject the attach/detach out into its own control loop.
-			detachDiskLogError(pd)
 		}
 		return err
 	}
@@ -227,6 +335,18 @@ func (pd *gcePersistentDisk) SetUp() error {
 
 func makeGlobalPDName(host volume.Host, devName string, readOnly bool) string {
 	return path.Join(host.GetPluginDir(gcePersistentDiskPluginName), "mounts", devName)
+}
+
+func listGlobalPDs(host volume.Host) ([]string, error) {
+	files, err := ioutil.ReadDir(path.Join(host.GetPluginDir(gcePersistentDiskPluginName), "mounts"))
+	if err != nil {
+		return nil, err
+	}
+	result := make([]string, len(files))
+	for ix := range files {
+		result[ix] = files[ix].Name()
+	}
+	return result, nil
 }
 
 func (pd *gcePersistentDisk) GetPath() string {
@@ -245,23 +365,13 @@ func (pd *gcePersistentDisk) TearDown() error {
 		return err
 	}
 	if !mountpoint {
+		attachedDiskMgr.DetachDisk(pd.pdName)
+		attachedDiskMgr.Notify()
 		return os.Remove(pd.GetPath())
 	}
 
-	devicePath, refCount, err := getMountRefCount(pd.mounter, pd.GetPath())
-	if err != nil {
-		return err
-	}
 	if err := pd.mounter.Unmount(pd.GetPath(), 0); err != nil {
 		return err
-	}
-	refCount--
-	// If refCount is 1, then all bind mounts have been removed, and the
-	// remaining reference is the global mount. It is safe to detach.
-	if refCount == 1 {
-		if err := pd.manager.DetachDisk(pd, devicePath); err != nil {
-			return err
-		}
 	}
 	mountpoint, mntErr := isMountPoint(pd.GetPath())
 	if mntErr != nil {
@@ -269,9 +379,9 @@ func (pd *gcePersistentDisk) TearDown() error {
 		return err
 	}
 	if !mountpoint {
-		if err := os.Remove(pd.GetPath()); err != nil {
-			return err
-		}
+		attachedDiskMgr.DetachDisk(pd.pdName)
+		attachedDiskMgr.Notify()
+		return os.Remove(pd.GetPath())
 	}
 	return nil
 }
