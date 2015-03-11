@@ -119,7 +119,7 @@ func NewForbidden(kind, name string, err error) error {
 }
 
 // NewConflict returns an error indicating the item can't be updated as provided.
-func NewConflict(kind, name string, err error) error {
+func NewConflict(kind, name string, err error) *StatusError {
 	return &StatusError{api.Status{
 		Status: api.StatusFailure,
 		Code:   http.StatusConflict,

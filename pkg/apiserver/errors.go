@@ -21,8 +21,10 @@ import (
 	"net/http"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
+	"github.com/GoogleCloudPlatform/kubernetes/pkg/api/errors"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/tools"
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/util"
+	"github.com/coreos/go-etcd/etcd"
 )
 
 // statusError is an object that can be converted into an api.Status
@@ -33,6 +35,17 @@ type statusError interface {
 // errToAPIStatus converts an error to an api.Status object.
 func errToAPIStatus(err error) *api.Status {
 	switch t := err.(type) {
+	case etcd.EtcdError, *etcd.EtcdError:
+		if tools.IsEtcdTestFailed(err) {
+			statusObj := errors.NewConflict("unknown", "unknown", err).Status()
+			return &statusObj
+		}
+		return &api.Status{
+			Status:  api.StatusFailure,
+			Code:    http.StatusInternalServerError,
+			Reason:  api.StatusReasonUnknown,
+			Message: fmt.Sprintf("Request to backend storage failed: %s", err.Error()),
+		}
 	case statusError:
 		status := t.Status()
 		if len(status.Status) == 0 {
@@ -53,12 +66,6 @@ func errToAPIStatus(err error) *api.Status {
 		//TODO: check for invalid responses
 		return &status
 	default:
-		status := http.StatusInternalServerError
-		switch {
-		//TODO: replace me with NewConflictErr
-		case tools.IsEtcdTestFailed(err):
-			status = http.StatusConflict
-		}
 		// Log errors that were not converted to an error status
 		// by REST storage - these typically indicate programmer
 		// error by not using pkg/api/errors, or unexpected failure
@@ -66,7 +73,7 @@ func errToAPIStatus(err error) *api.Status {
 		util.HandleError(fmt.Errorf("apiserver received an error that is not an api.Status: %v", err))
 		return &api.Status{
 			Status:  api.StatusFailure,
-			Code:    status,
+			Code:    http.StatusInternalServerError,
 			Reason:  api.StatusReasonUnknown,
 			Message: err.Error(),
 		}
